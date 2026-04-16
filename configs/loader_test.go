@@ -2,13 +2,58 @@ package configs
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+// fakeRemoteProvider is a test double for RemoteProvider.
+type fakeRemoteProvider struct {
+	mu       sync.Mutex
+	data     map[string]any
+	fetchErr error
+	watchers []func(error)
+}
+
+func newFakeRemote(data map[string]any) *fakeRemoteProvider {
+	return &fakeRemoteProvider{data: data}
+}
+
+func (f *fakeRemoteProvider) Fetch(_ context.Context) (map[string]any, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fetchErr != nil {
+		return nil, f.fetchErr
+	}
+	out := make(map[string]any, len(f.data))
+	for k, v := range f.data {
+		out[k] = v
+	}
+	return out, nil
+}
+
+func (f *fakeRemoteProvider) Watch(_ context.Context, onChange func(error)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.watchers = append(f.watchers, onChange)
+}
+
+// update sets new data and notifies all watchers.
+func (f *fakeRemoteProvider) update(data map[string]any) {
+	f.mu.Lock()
+	f.data = data
+	watchers := make([]func(error), len(f.watchers))
+	copy(watchers, f.watchers)
+	f.mu.Unlock()
+	for _, w := range watchers {
+		w(nil)
+	}
+}
 
 // --- Validation ---
 
@@ -554,6 +599,157 @@ func TestValidateRulesInFlagHelp(t *testing.T) {
 	}
 	if !strings.Contains(flag.Usage, "min: 1") || !strings.Contains(flag.Usage, "max: 65535") {
 		t.Errorf("flag usage = %q, want it to contain validation rules", flag.Usage)
+	}
+}
+
+// --- Remote Config ---
+
+func TestRemoteSource(t *testing.T) {
+	type cfg struct {
+		Port int    `yaml:"port" default:"8080"`
+		Host string `yaml:"host" default:"localhost"`
+	}
+	remote := newFakeRemote(map[string]any{"port": 9090, "host": "remote.host"})
+	c := &cfg{}
+	if err := Load(c, WithRemote(remote), WithoutFlags()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.Port != 9090 {
+		t.Errorf("Port = %d, want 9090", c.Port)
+	}
+	if c.Host != "remote.host" {
+		t.Errorf("Host = %q, want %q", c.Host, "remote.host")
+	}
+}
+
+func TestRemoteOverridesFile(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.yaml")
+	os.WriteFile(cfgFile, []byte("port: 7070\nhost: file.host\n"), 0644)
+
+	type cfg struct {
+		Port int    `yaml:"port" default:"8080"`
+		Host string `yaml:"host" default:"localhost"`
+	}
+	// file registered first (lower precedence), remote registered second (higher precedence)
+	remote := newFakeRemote(map[string]any{"port": 9090})
+	c := &cfg{}
+	if err := Load(c, WithConfigFile(cfgFile), WithRemote(remote), WithoutFlags()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.Port != 9090 {
+		t.Errorf("Port = %d, want 9090 (remote should override file)", c.Port)
+	}
+	// host only set in file, not in remote — file value preserved
+	if c.Host != "file.host" {
+		t.Errorf("Host = %q, want %q (file value when remote doesn't set it)", c.Host, "file.host")
+	}
+}
+
+func TestFileOverridesRemote(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.yaml")
+	os.WriteFile(cfgFile, []byte("port: 7070\n"), 0644)
+
+	type cfg struct {
+		Port int `yaml:"port" default:"8080"`
+	}
+	// remote registered first (lower precedence), file registered second (higher precedence)
+	remote := newFakeRemote(map[string]any{"port": 9090})
+	c := &cfg{}
+	if err := Load(c, WithRemote(remote), WithConfigFile(cfgFile), WithoutFlags()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.Port != 7070 {
+		t.Errorf("Port = %d, want 7070 (file should override remote)", c.Port)
+	}
+}
+
+func TestLoaderSourceRemote(t *testing.T) {
+	type cfg struct {
+		Port int `yaml:"port" default:"8080"`
+	}
+	remote := newFakeRemote(map[string]any{"port": 9090})
+	c := &cfg{}
+	loader := NewLoader(WithRemote(remote), WithoutFlags())
+	if err := loader.Load(c); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	loader.Print(&buf)
+	if !strings.Contains(buf.String(), "remote") {
+		t.Errorf("expected source 'remote' in output:\n%s", buf.String())
+	}
+}
+
+func TestLoaderWatchRemote(t *testing.T) {
+	type cfg struct {
+		Port int `yaml:"port" default:"8080"`
+	}
+	remote := newFakeRemote(map[string]any{"port": 9090})
+	c := &cfg{}
+	loader := NewLoader(WithRemote(remote), WithoutFlags())
+	if err := loader.Load(c); err != nil {
+		t.Fatal(err)
+	}
+	if c.Port != 9090 {
+		t.Fatalf("Port = %d, want 9090", c.Port)
+	}
+
+	done := make(chan error, 1)
+	if err := loader.Watch(c, func(err error) {
+		done <- err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	remote.update(map[string]any{"port": 3000})
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Watch callback error: %v", err)
+		}
+		if c.Port != 3000 {
+			t.Errorf("Port = %d, want 3000 after reload", c.Port)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Watch callback not called within 3 seconds")
+	}
+}
+
+func TestLoaderWatchRemoteValidationError(t *testing.T) {
+	type cfg struct {
+		Port int `yaml:"port" default:"8080" validate:"min=1,max=65535"`
+	}
+	remote := newFakeRemote(map[string]any{"port": 9090})
+	c := &cfg{}
+	loader := NewLoader(WithRemote(remote), WithoutFlags())
+	if err := loader.Load(c); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	if err := loader.Watch(c, func(err error) {
+		done <- err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	remote.update(map[string]any{"port": 99999})
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected validation error from Watch")
+		}
+		// cfg should retain old value on error
+		if c.Port != 9090 {
+			t.Errorf("Port = %d, want 9090 (unchanged on validation error)", c.Port)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Watch callback not called within 3 seconds")
 	}
 }
 

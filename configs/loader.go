@@ -1,6 +1,7 @@
 package configs
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"reflect"
@@ -16,12 +17,12 @@ import (
 
 // Loader holds the state for loading, printing, and watching configuration.
 type Loader struct {
-	v         *viper.Viper
-	fs        *pflag.FlagSet
-	opts      *options
-	fields    []fieldInfo
-	fileViper *viper.Viper
-	cfg       any
+	v            *viper.Viper
+	fs           *pflag.FlagSet
+	opts         *options
+	fields       []fieldInfo
+	sourceVipers []*viper.Viper
+	cfg          any
 }
 
 // NewLoader creates a Loader with the given options.
@@ -33,7 +34,7 @@ func NewLoader(opts ...Option) *Loader {
 	return &Loader{opts: o}
 }
 
-// Load parses configuration into cfg from defaults, config file, env vars, and flags.
+// Load parses configuration into cfg from defaults, config sources, env vars, and flags.
 // cfg must be a pointer to a struct.
 func (l *Loader) Load(cfg any) error {
 	rv := reflect.ValueOf(cfg)
@@ -51,14 +52,31 @@ func (l *Loader) Load(cfg any) error {
 		}
 	}
 
-	if l.opts.configFile != "" {
-		l.v.SetConfigFile(l.opts.configFile)
-		if err := l.v.ReadInConfig(); err != nil {
-			return fmt.Errorf("configs: reading config file: %w", err)
+	l.sourceVipers = make([]*viper.Viper, len(l.opts.sources))
+	for i, src := range l.opts.sources {
+		sv := viper.New()
+		switch src.kind {
+		case sourceKindFile:
+			sv.SetConfigFile(src.filePath)
+			if err := sv.ReadInConfig(); err != nil {
+				return fmt.Errorf("configs: reading config file %s: %w", src.filePath, err)
+			}
+			if err := l.v.MergeConfigMap(sv.AllSettings()); err != nil {
+				return fmt.Errorf("configs: merging config file %s: %w", src.filePath, err)
+			}
+		case sourceKindRemote:
+			data, err := src.provider.Fetch(context.Background())
+			if err != nil {
+				return fmt.Errorf("configs: fetching remote config: %w", err)
+			}
+			if err := sv.MergeConfigMap(data); err != nil {
+				return fmt.Errorf("configs: setting remote config for tracking: %w", err)
+			}
+			if err := l.v.MergeConfigMap(data); err != nil {
+				return fmt.Errorf("configs: merging remote config: %w", err)
+			}
 		}
-		l.fileViper = viper.New()
-		l.fileViper.SetConfigFile(l.opts.configFile)
-		_ = l.fileViper.ReadInConfig()
+		l.sourceVipers[i] = sv
 	}
 
 	for _, f := range l.fields {
@@ -109,47 +127,139 @@ func (l *Loader) Load(cfg any) error {
 	return nil
 }
 
-// Watch watches the config file for changes and reloads cfg on each change.
+// Watch watches all registered config sources for changes and reloads cfg on each change.
 // onChange receives nil on success or an error if reload/validation failed.
 // On error, cfg retains its previous values.
 func (l *Loader) Watch(cfg any, onChange func(error)) error {
-	if l.opts.configFile == "" {
-		return fmt.Errorf("configs: Watch requires a config file (use WithConfigFile)")
+	if len(l.opts.sources) == 0 {
+		return fmt.Errorf("configs: Watch requires at least one config source (use WithConfigFile or WithRemote)")
 	}
 
-	l.v.OnConfigChange(func(_ fsnotify.Event) {
-		l.fileViper = viper.New()
-		l.fileViper.SetConfigFile(l.opts.configFile)
-		_ = l.fileViper.ReadInConfig()
+	reload := func() {
+		onChange(l.reload(cfg))
+	}
 
-		var missing []string
-		for _, f := range l.fields {
-			if f.required && l.v.Get(f.viperKey) == nil {
-				missing = append(missing, f.viperKey)
+	ctx := context.Background()
+
+	for _, src := range l.opts.sources {
+		switch src.kind {
+		case sourceKindFile:
+			watcher, err := fsnotify.NewWatcher()
+			if err != nil {
+				return fmt.Errorf("configs: creating file watcher: %w", err)
+			}
+			if err := watcher.Add(src.filePath); err != nil {
+				_ = watcher.Close()
+				return fmt.Errorf("configs: watching file %s: %w", src.filePath, err)
+			}
+			go func() {
+				defer watcher.Close()
+				for {
+					select {
+					case _, ok := <-watcher.Events:
+						if !ok {
+							return
+						}
+						reload()
+					case err, ok := <-watcher.Errors:
+						if !ok {
+							return
+						}
+						onChange(err)
+					}
+				}
+			}()
+		case sourceKindRemote:
+			src.provider.Watch(ctx, func(err error) {
+				if err != nil {
+					onChange(err)
+					return
+				}
+				reload()
+			})
+		}
+	}
+
+	return nil
+}
+
+// reload re-fetches all sources in order, validates, and atomically swaps cfg on success.
+func (l *Loader) reload(cfg any) error {
+	newV := viper.New()
+	newSourceVipers := make([]*viper.Viper, len(l.opts.sources))
+
+	for _, f := range l.fields {
+		if f.hasDefault {
+			newV.SetDefault(f.viperKey, f.defaultVal)
+		}
+	}
+
+	for i, src := range l.opts.sources {
+		sv := viper.New()
+		switch src.kind {
+		case sourceKindFile:
+			sv.SetConfigFile(src.filePath)
+			if err := sv.ReadInConfig(); err != nil {
+				return fmt.Errorf("configs: reading config file %s: %w", src.filePath, err)
+			}
+			if err := newV.MergeConfigMap(sv.AllSettings()); err != nil {
+				return fmt.Errorf("configs: merging config file %s: %w", src.filePath, err)
+			}
+		case sourceKindRemote:
+			data, err := src.provider.Fetch(context.Background())
+			if err != nil {
+				return fmt.Errorf("configs: fetching remote config: %w", err)
+			}
+			if err := sv.MergeConfigMap(data); err != nil {
+				return fmt.Errorf("configs: setting remote config for tracking: %w", err)
+			}
+			if err := newV.MergeConfigMap(data); err != nil {
+				return fmt.Errorf("configs: merging remote config: %w", err)
 			}
 		}
-		if len(missing) > 0 {
-			onChange(fmt.Errorf("configs: required values not set: %s", strings.Join(missing, ", ")))
-			return
-		}
+		newSourceVipers[i] = sv
+	}
 
-		rv := reflect.ValueOf(cfg)
-		tmp := reflect.New(rv.Elem().Type())
-		if err := l.v.Unmarshal(tmp.Interface(), l.decoderOpt()); err != nil {
-			onChange(fmt.Errorf("configs: reloading: %w", err))
-			return
+	for _, f := range l.fields {
+		envKey := f.envKey
+		if l.opts.envPrefix != "" {
+			envKey = l.opts.envPrefix + "_" + f.envKey
 		}
+		_ = newV.BindEnv(f.viperKey, envKey)
+	}
 
-		if err := validateStruct(tmp.Elem(), l.fields); err != nil {
-			onChange(err)
-			return
+	if l.fs != nil {
+		for _, f := range l.fields {
+			if flag := l.fs.Lookup(f.flagKey); flag != nil {
+				_ = newV.BindPFlag(f.viperKey, flag)
+			}
 		}
+	}
 
-		rv.Elem().Set(tmp.Elem())
-		l.cfg = cfg
-		onChange(nil)
-	})
-	l.v.WatchConfig()
+	var missing []string
+	for _, f := range l.fields {
+		if f.required && newV.Get(f.viperKey) == nil {
+			missing = append(missing, f.viperKey)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("configs: required values not set: %s", strings.Join(missing, ", "))
+	}
+
+	rv := reflect.ValueOf(cfg)
+	tmp := reflect.New(rv.Elem().Type())
+	if err := newV.Unmarshal(tmp.Interface(), l.decoderOpt()); err != nil {
+		return fmt.Errorf("configs: reloading: %w", err)
+	}
+
+	if err := validateStruct(tmp.Elem(), l.fields); err != nil {
+		return err
+	}
+
+	l.v = newV
+	l.sourceVipers = newSourceVipers
+	rv.Elem().Set(tmp.Elem())
+	l.cfg = cfg
 	return nil
 }
 
@@ -166,8 +276,15 @@ func (l *Loader) resolveSource(f fieldInfo) string {
 	if _, ok := os.LookupEnv(envKey); ok {
 		return "env"
 	}
-	if l.fileViper != nil && l.fileViper.IsSet(f.viperKey) {
-		return "file"
+	for i := len(l.sourceVipers) - 1; i >= 0; i-- {
+		if l.sourceVipers[i].IsSet(f.viperKey) {
+			switch l.opts.sources[i].kind {
+			case sourceKindFile:
+				return "file"
+			case sourceKindRemote:
+				return "remote"
+			}
+		}
 	}
 	if f.hasDefault {
 		return "default"

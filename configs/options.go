@@ -2,8 +2,21 @@ package configs
 
 import "strings"
 
+type sourceKind int
+
+const (
+	sourceKindFile sourceKind = iota
+	sourceKindRemote
+)
+
+type configSource struct {
+	kind     sourceKind
+	filePath string         // sourceKindFile
+	provider RemoteProvider // sourceKindRemote
+}
+
 type options struct {
-	configFile    string
+	sources       []configSource
 	envPrefix     string
 	args          []string
 	flagsDisabled bool
@@ -16,11 +29,15 @@ func defaultOptions() *options {
 	return &options{}
 }
 
-// WithConfigFile sets the path to a YAML config file.
+// WithConfigFile adds a YAML config file as a config source at the current precedence position.
 // Load returns an error if the file does not exist or cannot be parsed.
+// Multiple calls are allowed; later calls have higher precedence over earlier ones.
 func WithConfigFile(path string) Option {
 	return func(o *options) {
-		o.configFile = path
+		o.sources = append(o.sources, configSource{
+			kind:     sourceKindFile,
+			filePath: path,
+		})
 	}
 }
 

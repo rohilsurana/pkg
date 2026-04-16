@@ -223,6 +223,87 @@ loader.Watch(cfg, func(err error) {
 - On error, the struct retains its previous values
 - Env vars and flags still apply their precedence on reload
 
+## Remote Config
+
+Any source that implements `RemoteProvider` can be mixed into the loading order alongside config files. Registration order determines precedence — later = higher priority within the file/remote layer. Env vars and flags always win.
+
+```
+flags > env > last_registered_source > ... > first_registered_source > defaults
+```
+
+```go
+type RemoteProvider interface {
+    Fetch(ctx context.Context) (map[string]any, error)
+    Watch(ctx context.Context, onChange func(error))
+}
+```
+
+```go
+loader := configs.NewLoader(
+    configs.WithConfigFile("base.yaml"),   // lowest among sources
+    configs.WithRemote(etcdProvider),       // middle
+    configs.WithConfigFile("local.yaml"),   // highest among sources
+    configs.WithEnvPrefix("APP"),
+)
+// Precedence: flags > env > local.yaml > etcd > base.yaml > defaults
+```
+
+### Implementing RemoteProvider
+
+Return a nested map matching your YAML structure:
+
+```go
+type EtcdProvider struct {
+    client *etcd.Client
+    key    string
+}
+
+func (e *EtcdProvider) Fetch(ctx context.Context) (map[string]any, error) {
+    resp, err := e.client.Get(ctx, e.key)
+    if err != nil {
+        return nil, err
+    }
+    var data map[string]any
+    if err := yaml.Unmarshal(resp.Kvs[0].Value, &data); err != nil {
+        return nil, err
+    }
+    return data, nil
+}
+
+func (e *EtcdProvider) Watch(ctx context.Context, onChange func(error)) {
+    go func() {
+        ch := e.client.Watch(ctx, e.key)
+        for range ch {
+            onChange(nil) // loader calls Fetch to get fresh data
+        }
+    }()
+}
+```
+
+### Watching Remote Sources
+
+`Watch` works across all source types — file and remote sources are watched together:
+
+```go
+loader := configs.NewLoader(
+    configs.WithConfigFile("config.yaml"),
+    configs.WithRemote(etcdProvider),
+)
+if err := loader.Load(cfg); err != nil {
+    log.Fatal(err)
+}
+
+loader.Watch(cfg, func(err error) {
+    if err != nil {
+        log.Println("config reload failed:", err)
+        return
+    }
+    log.Println("config reloaded")
+})
+```
+
+On any change (file or remote), all sources are re-read in order and the config is reloaded atomically with the same safe-swap semantics: unmarshal into a temp copy → validate → swap only on success.
+
 ## Custom Types
 
 Any type implementing `encoding.TextUnmarshaler` or `configs.Decoder` is treated as a leaf value parsed from a string. It works with all sources (defaults, YAML, env, flags).
