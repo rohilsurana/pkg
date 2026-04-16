@@ -124,6 +124,66 @@ configs.WithConfigFile("config.yaml") // path to YAML config file
 configs.WithEnvPrefix("APP")          // prefix for env vars: APP_PORT, APP_HOST, etc.
 configs.WithArgs([]string{...})       // override os.Args[1:] for flag parsing (useful for testing)
 configs.WithoutFlags()                // disable flag parsing entirely
+configs.WithConfigFlag("config")      // enable built-in --config flag (file paths or URLs)
+configs.WithURLScheme("etcd", fn)     // register a resolver for scheme://... values in --config
+configs.WithExtraFlags(func(fs))      // register additional flags on the loader's FlagSet
+```
+
+## --config Flag
+
+`WithConfigFlag` adds a built-in flag that accepts file paths or `scheme://...` URLs. Users can specify it multiple times; later values have higher precedence. All `--config` sources are loaded after explicit `WithConfigFile`/`WithRemote` sources.
+
+```go
+loader := configs.NewLoader(
+    configs.WithConfigFile("defaults.yaml"), // always loaded (lowest)
+    configs.WithConfigFlag("config"),         // enables --config flag
+    configs.WithEnvPrefix("APP"),
+)
+if err := loader.Load(cfg); err != nil {
+    log.Fatal(err)
+}
+```
+
+```bash
+# Override at runtime
+./myapp --config /etc/app/prod.yaml
+
+# Multiple sources (last wins)
+./myapp --config base.yaml --config /etc/app/local.yaml
+```
+
+### URL Schemes
+
+Register a resolver for any URL scheme so users can point `--config` at remote sources:
+
+```go
+loader := configs.NewLoader(
+    configs.WithConfigFlag("config"),
+    configs.WithURLScheme("https", func(rawURL string) (configs.RemoteProvider, error) {
+        return NewHTTPProvider(rawURL), nil
+    }),
+)
+// ./myapp --config https://config.internal/app.yaml
+```
+
+### Auth via Extra Flags
+
+Use `WithExtraFlags` to add auth flags that are parsed before resolvers run. Variables captured in the resolver closure already hold their flag values:
+
+```go
+var token string
+
+loader := configs.NewLoader(
+    configs.WithConfigFlag("config"),
+    configs.WithExtraFlags(func(fs *pflag.FlagSet) {
+        fs.StringVar(&token, "config-token", os.Getenv("CONFIG_TOKEN"), "bearer token")
+    }),
+    configs.WithURLScheme("https", func(rawURL string) (configs.RemoteProvider, error) {
+        return NewHTTPProvider(rawURL, token), nil // token is populated here
+    }),
+)
+
+// ./myapp --config https://config.internal/app.yaml --config-token mybearer
 ```
 
 ## Validation

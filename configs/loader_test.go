@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/spf13/pflag"
 )
 
 // fakeRemoteProvider is a test double for RemoteProvider.
@@ -599,6 +601,173 @@ func TestValidateRulesInFlagHelp(t *testing.T) {
 	}
 	if !strings.Contains(flag.Usage, "min: 1") || !strings.Contains(flag.Usage, "max: 65535") {
 		t.Errorf("flag usage = %q, want it to contain validation rules", flag.Usage)
+	}
+}
+
+// --- WithConfigFlag ---
+
+func TestConfigFlag(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.yaml")
+	os.WriteFile(cfgFile, []byte("port: 9090\n"), 0644)
+
+	type cfg struct {
+		Port int `yaml:"port" default:"8080"`
+	}
+	c := &cfg{}
+	if err := Load(c, WithConfigFlag("config"), WithArgs([]string{"--config", cfgFile})); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.Port != 9090 {
+		t.Errorf("Port = %d, want 9090", c.Port)
+	}
+}
+
+func TestConfigFlagOverridesExplicit(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.yaml")
+	override := filepath.Join(dir, "override.yaml")
+	os.WriteFile(base, []byte("port: 7070\n"), 0644)
+	os.WriteFile(override, []byte("port: 9090\n"), 0644)
+
+	type cfg struct {
+		Port int `yaml:"port" default:"8080"`
+	}
+	c := &cfg{}
+	err := Load(c,
+		WithConfigFile(base),
+		WithConfigFlag("config"),
+		WithArgs([]string{"--config", override}),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// --config file has higher precedence than WithConfigFile
+	if c.Port != 9090 {
+		t.Errorf("Port = %d, want 9090 (--config should override WithConfigFile)", c.Port)
+	}
+}
+
+func TestConfigFlagMultiple(t *testing.T) {
+	dir := t.TempDir()
+	first := filepath.Join(dir, "first.yaml")
+	second := filepath.Join(dir, "second.yaml")
+	os.WriteFile(first, []byte("port: 7070\nhost: first\n"), 0644)
+	os.WriteFile(second, []byte("port: 9090\n"), 0644)
+
+	type cfg struct {
+		Port int    `yaml:"port" default:"8080"`
+		Host string `yaml:"host" default:"localhost"`
+	}
+	c := &cfg{}
+	err := Load(c,
+		WithConfigFlag("config"),
+		WithArgs([]string{"--config", first, "--config", second}),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// second has higher precedence for port
+	if c.Port != 9090 {
+		t.Errorf("Port = %d, want 9090 (second --config wins)", c.Port)
+	}
+	// host only in first, preserved
+	if c.Host != "first" {
+		t.Errorf("Host = %q, want %q", c.Host, "first")
+	}
+}
+
+func TestConfigFlagURLScheme(t *testing.T) {
+	type cfg struct {
+		Port int `yaml:"port" default:"8080"`
+	}
+	remote := newFakeRemote(map[string]any{"port": 9090})
+
+	c := &cfg{}
+	err := Load(c,
+		WithConfigFlag("config"),
+		WithURLScheme("fake", func(rawURL string) (RemoteProvider, error) {
+			return remote, nil
+		}),
+		WithArgs([]string{"--config", "fake://host/key"}),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.Port != 9090 {
+		t.Errorf("Port = %d, want 9090 (from URL scheme resolver)", c.Port)
+	}
+}
+
+func TestConfigFlagUnknownScheme(t *testing.T) {
+	type cfg struct {
+		Port int `yaml:"port" default:"8080"`
+	}
+	c := &cfg{}
+	err := Load(c,
+		WithConfigFlag("config"),
+		WithArgs([]string{"--config", "etcd://host/key"}),
+	)
+	if err == nil {
+		t.Fatal("expected error for unregistered scheme")
+	}
+	if !strings.Contains(err.Error(), "etcd") {
+		t.Errorf("error = %q, want it to mention the scheme", err.Error())
+	}
+}
+
+// --- WithExtraFlags ---
+
+func TestExtraFlags(t *testing.T) {
+	type cfg struct {
+		Port int `yaml:"port" default:"8080"`
+	}
+	var name string
+	c := &cfg{}
+	err := Load(c,
+		WithExtraFlags(func(fs *pflag.FlagSet) {
+			fs.StringVar(&name, "name", "default", "app name")
+		}),
+		WithArgs([]string{"--name", "myapp"}),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name != "myapp" {
+		t.Errorf("name = %q, want %q", name, "myapp")
+	}
+}
+
+func TestExtraFlagsWithURLScheme(t *testing.T) {
+	type cfg struct {
+		Port int `yaml:"port" default:"8080"`
+	}
+	// token is captured by the resolver closure; populated from --config-token flag
+	var token string
+	var capturedToken string
+
+	c := &cfg{}
+	remote := newFakeRemote(map[string]any{"port": 9090})
+
+	err := Load(c,
+		WithConfigFlag("config"),
+		WithExtraFlags(func(fs *pflag.FlagSet) {
+			fs.StringVar(&token, "config-token", "", "bearer token")
+		}),
+		WithURLScheme("fake", func(rawURL string) (RemoteProvider, error) {
+			capturedToken = token // token is populated by the time this runs
+			return remote, nil
+		}),
+		WithArgs([]string{"--config", "fake://host/key", "--config-token", "mybearer"}),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.Port != 9090 {
+		t.Errorf("Port = %d, want 9090", c.Port)
+	}
+	if capturedToken != "mybearer" {
+		t.Errorf("capturedToken = %q, want %q (token should be set before resolver runs)", capturedToken, "mybearer")
 	}
 }
 
