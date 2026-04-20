@@ -267,6 +267,16 @@ func (l *Loader) reload(cfg any) error {
 	return nil
 }
 
+// Reload re-fetches all config sources and updates the struct last passed to Load.
+// It applies the same safe-swap semantics as Watch: the struct is only updated
+// if unmarshaling and validation both succeed. On error, the struct retains its previous values.
+func (l *Loader) Reload() error {
+	if l.cfg == nil {
+		return fmt.Errorf("configs: Reload called before Load")
+	}
+	return l.reload(l.cfg)
+}
+
 // resolveConfigValue turns a --config flag value into a configSource.
 // Values containing "://" are treated as URLs and routed to a registered scheme resolver.
 // All other values are treated as file paths.
@@ -292,6 +302,11 @@ func mergeSourceInto(v *viper.Viper, src configSource) (*viper.Viper, error) {
 	sv := viper.New()
 	switch src.kind {
 	case sourceKindFile:
+		if src.optional {
+			if _, err := os.Stat(src.filePath); os.IsNotExist(err) {
+				return sv, nil
+			}
+		}
 		sv.SetConfigFile(src.filePath)
 		if err := sv.ReadInConfig(); err != nil {
 			return nil, fmt.Errorf("configs: reading config file %s: %w", src.filePath, err)

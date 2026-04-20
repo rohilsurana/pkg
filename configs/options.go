@@ -17,6 +17,7 @@ type configSource struct {
 	kind     sourceKind
 	filePath string         // sourceKindFile
 	provider RemoteProvider // sourceKindRemote
+	optional bool           // sourceKindFile: skip silently if file does not exist
 }
 
 type options struct {
@@ -46,6 +47,19 @@ func WithConfigFile(path string) Option {
 		o.sources = append(o.sources, configSource{
 			kind:     sourceKindFile,
 			filePath: path,
+		})
+	}
+}
+
+// WithOptionalConfigFile adds a YAML config file that is silently skipped if it does not exist.
+// If the file exists but cannot be parsed, Load still returns an error.
+// Useful for local override files (e.g. config.local.yaml) that only some environments have.
+func WithOptionalConfigFile(path string) Option {
+	return func(o *options) {
+		o.sources = append(o.sources, configSource{
+			kind:     sourceKindFile,
+			filePath: path,
+			optional: true,
 		})
 	}
 }

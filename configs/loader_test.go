@@ -604,6 +604,170 @@ func TestValidateRulesInFlagHelp(t *testing.T) {
 	}
 }
 
+// --- WithOptionalConfigFile ---
+
+func TestOptionalConfigFileMissing(t *testing.T) {
+	type cfg struct {
+		Port int `yaml:"port" default:"8080"`
+	}
+	c := &cfg{}
+	// Non-existent file with WithOptionalConfigFile must not error
+	if err := Load(c, WithOptionalConfigFile("/nonexistent/config.yaml"), WithoutFlags()); err != nil {
+		t.Fatalf("unexpected error for missing optional file: %v", err)
+	}
+	if c.Port != 8080 {
+		t.Errorf("Port = %d, want 8080 (default)", c.Port)
+	}
+}
+
+func TestOptionalConfigFilePresent(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.yaml")
+	os.WriteFile(cfgFile, []byte("port: 9090\n"), 0644)
+
+	type cfg struct {
+		Port int `yaml:"port" default:"8080"`
+	}
+	c := &cfg{}
+	if err := Load(c, WithOptionalConfigFile(cfgFile), WithoutFlags()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.Port != 9090 {
+		t.Errorf("Port = %d, want 9090", c.Port)
+	}
+}
+
+func TestOptionalConfigFilePrecedence(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.yaml")
+	local := filepath.Join(dir, "local.yaml")
+	os.WriteFile(base, []byte("port: 7070\nhost: base\n"), 0644)
+	os.WriteFile(local, []byte("port: 9090\n"), 0644)
+
+	type cfg struct {
+		Port int    `yaml:"port" default:"8080"`
+		Host string `yaml:"host" default:"localhost"`
+	}
+	c := &cfg{}
+	err := Load(c,
+		WithConfigFile(base),
+		WithOptionalConfigFile(local), // local overrides base when present
+		WithoutFlags(),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.Port != 9090 {
+		t.Errorf("Port = %d, want 9090 (local overrides base)", c.Port)
+	}
+	if c.Host != "base" {
+		t.Errorf("Host = %q, want %q (base value preserved when local doesn't set it)", c.Host, "base")
+	}
+}
+
+func TestOptionalConfigFileBadSyntax(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "bad.yaml")
+	os.WriteFile(cfgFile, []byte("port: [invalid yaml\n"), 0644)
+
+	type cfg struct {
+		Port int `yaml:"port" default:"8080"`
+	}
+	c := &cfg{}
+	// File exists but is malformed — must still error
+	if err := Load(c, WithOptionalConfigFile(cfgFile), WithoutFlags()); err == nil {
+		t.Fatal("expected error for malformed optional config file")
+	}
+}
+
+// --- MustLoad ---
+
+func TestMustLoadSuccess(t *testing.T) {
+	type cfg struct {
+		Port int `yaml:"port" default:"8080"`
+	}
+	c := &cfg{}
+	// Should not panic
+	MustLoad(c, WithoutFlags())
+	if c.Port != 8080 {
+		t.Errorf("Port = %d, want 8080", c.Port)
+	}
+}
+
+func TestMustLoadPanics(t *testing.T) {
+	type cfg struct {
+		Token string `yaml:"token" required:"true"`
+	}
+	c := &cfg{}
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected MustLoad to panic on error")
+		}
+	}()
+	MustLoad(c, WithoutFlags())
+}
+
+// --- Reload ---
+
+func TestReload(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.yaml")
+	os.WriteFile(cfgFile, []byte("port: 8080\n"), 0644)
+
+	type cfg struct {
+		Port int `yaml:"port" default:"3000"`
+	}
+	c := &cfg{}
+	loader := NewLoader(WithConfigFile(cfgFile), WithoutFlags())
+	if err := loader.Load(c); err != nil {
+		t.Fatal(err)
+	}
+	if c.Port != 8080 {
+		t.Fatalf("Port = %d, want 8080", c.Port)
+	}
+
+	// Change the file and reload manually
+	os.WriteFile(cfgFile, []byte("port: 9090\n"), 0644)
+	if err := loader.Reload(); err != nil {
+		t.Fatalf("Reload error: %v", err)
+	}
+	if c.Port != 9090 {
+		t.Errorf("Port = %d, want 9090 after Reload", c.Port)
+	}
+}
+
+func TestReloadBeforeLoad(t *testing.T) {
+	loader := NewLoader(WithoutFlags())
+	if err := loader.Reload(); err == nil {
+		t.Fatal("expected error when Reload called before Load")
+	}
+}
+
+func TestReloadValidationError(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.yaml")
+	os.WriteFile(cfgFile, []byte("port: 8080\n"), 0644)
+
+	type cfg struct {
+		Port int `yaml:"port" default:"3000" validate:"min=1,max=65535"`
+	}
+	c := &cfg{}
+	loader := NewLoader(WithConfigFile(cfgFile), WithoutFlags())
+	if err := loader.Load(c); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write invalid value then reload
+	os.WriteFile(cfgFile, []byte("port: 99999\n"), 0644)
+	if err := loader.Reload(); err == nil {
+		t.Fatal("expected validation error from Reload")
+	}
+	// cfg retains previous valid value
+	if c.Port != 8080 {
+		t.Errorf("Port = %d, want 8080 (unchanged on validation error)", c.Port)
+	}
+}
+
 // --- WithConfigFlag ---
 
 func TestConfigFlag(t *testing.T) {

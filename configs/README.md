@@ -19,8 +19,6 @@ package main
 
 import (
     "fmt"
-    "log"
-    "os"
     "time"
 
     "github.com/rohilsurana/pkg/configs"
@@ -41,13 +39,11 @@ type Config struct {
 
 func main() {
     cfg := &Config{}
-    err := configs.Load(cfg,
+    configs.MustLoad(cfg,
         configs.WithConfigFile("config.yaml"),
+        configs.WithOptionalConfigFile("config.local.yaml"), // local overrides, gitignored
         configs.WithEnvPrefix("APP"),
     )
-    if err != nil {
-        log.Fatal(err)
-    }
     fmt.Printf("Listening on %s:%d\n", cfg.Host, cfg.Port)
 }
 ```
@@ -120,13 +116,14 @@ Verbose bool `yaml:"verbose" flag:"v" default:"false"`
 ## Options
 
 ```go
-configs.WithConfigFile("config.yaml") // path to YAML config file
-configs.WithEnvPrefix("APP")          // prefix for env vars: APP_PORT, APP_HOST, etc.
-configs.WithArgs([]string{...})       // override os.Args[1:] for flag parsing (useful for testing)
-configs.WithoutFlags()                // disable flag parsing entirely
-configs.WithConfigFlag("config")      // enable built-in --config flag (file paths or URLs)
-configs.WithURLScheme("etcd", fn)     // register a resolver for scheme://... values in --config
-configs.WithExtraFlags(func(fs))      // register additional flags on the loader's FlagSet
+configs.WithConfigFile("config.yaml")         // path to YAML config file
+configs.WithOptionalConfigFile("local.yaml")  // like WithConfigFile but skipped if file is missing
+configs.WithEnvPrefix("APP")                  // prefix for env vars: APP_PORT, APP_HOST, etc.
+configs.WithArgs([]string{...})               // override os.Args[1:] for flag parsing (useful for testing)
+configs.WithoutFlags()                        // disable flag parsing entirely
+configs.WithConfigFlag("config")              // enable built-in --config flag (file paths or URLs)
+configs.WithURLScheme("etcd", fn)             // register a resolver for scheme://... values in --config
+configs.WithExtraFlags(func(fs))              // register additional flags on the loader's FlagSet
 ```
 
 ## --config Flag
@@ -282,6 +279,18 @@ loader.Watch(cfg, func(err error) {
 - Only if both succeed is the original struct updated
 - On error, the struct retains its previous values
 - Env vars and flags still apply their precedence on reload
+
+### Manual Reload
+
+Trigger a reload programmatically — useful on `SIGHUP`, from an HTTP handler, or in tests:
+
+```go
+if err := loader.Reload(); err != nil {
+    log.Println("reload failed:", err)
+}
+```
+
+`Reload` applies the same safe-swap semantics as `Watch`: the struct is only updated if both unmarshaling and validation succeed.
 
 ## Remote Config
 

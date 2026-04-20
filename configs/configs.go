@@ -1,7 +1,8 @@
 package configs
 
 // Load is a convenience function that parses configuration into cfg.
-// For advanced features (Print, Watch), use NewLoader instead.
+// Use MustLoad to panic on error instead of returning it.
+// For advanced features (Print, Watch, Reload), use NewLoader instead.
 //
 // cfg must be a pointer to a struct. Sources in order of increasing precedence:
 //
@@ -19,6 +20,14 @@ package configs
 //	validate:"rules"      — validation rules: min, max, oneof, notempty
 func Load(cfg any, opts ...Option) error {
 	return NewLoader(opts...).Load(cfg)
+}
+
+// MustLoad is like Load but panics on error. Intended for use in main() where a
+// config error is fatal and error-return boilerplate adds no value.
+func MustLoad(cfg any, opts ...Option) {
+	if err := Load(cfg, opts...); err != nil {
+		panic("configs: " + err.Error())
+	}
 }
 
 // Decoder is implemented by types that can decode themselves from a config string.
