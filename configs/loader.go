@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"reflect"
 	"strconv"
 	"strings"
@@ -176,13 +177,19 @@ func (l *Loader) Watch(cfg any, onChange func(error)) error {
 			}
 			go func() {
 				defer watcher.Close()
+				// Debounce rapid events (e.g. truncate+write generates multiple events)
+				// so that reload always reads the final file content.
+				var timer *time.Timer
 				for {
 					select {
 					case _, ok := <-watcher.Events:
 						if !ok {
 							return
 						}
-						reload()
+						if timer != nil {
+							timer.Stop()
+						}
+						timer = time.AfterFunc(50*time.Millisecond, reload)
 					case err, ok := <-watcher.Errors:
 						if !ok {
 							return
@@ -275,6 +282,32 @@ func (l *Loader) Reload() error {
 		return fmt.Errorf("configs: Reload called before Load")
 	}
 	return l.reload(l.cfg)
+}
+
+// WatchSignal listens for OS signals and triggers a config reload on each.
+// It starts a background goroutine; call signal.Stop and close the returned channel
+// (not exposed currently) to shut it down. onChange follows the same semantics as Watch:
+// nil on success, non-nil on reload or validation failure, cfg unchanged on error.
+//
+//	loader.WatchSignal(cfg, func(err error) {
+//	    if err != nil { log.Println("reload failed:", err); return }
+//	    log.Println("config reloaded")
+//	}, syscall.SIGHUP)
+func (l *Loader) WatchSignal(cfg any, onChange func(error), signals ...os.Signal) error {
+	if len(l.allSources) == 0 {
+		return fmt.Errorf("configs: WatchSignal requires at least one config source")
+	}
+	if len(signals) == 0 {
+		return fmt.Errorf("configs: WatchSignal requires at least one signal")
+	}
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, signals...)
+	go func() {
+		for range ch {
+			onChange(l.reload(cfg))
+		}
+	}()
+	return nil
 }
 
 // resolveConfigValue turns a --config flag value into a configSource.

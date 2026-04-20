@@ -292,6 +292,74 @@ if err := loader.Reload(); err != nil {
 
 `Reload` applies the same safe-swap semantics as `Watch`: the struct is only updated if both unmarshaling and validation succeed.
 
+### Signal-Based Reload
+
+Trigger a reload automatically on OS signals — the canonical pattern for `SIGHUP`-driven config refresh in Unix daemons:
+
+```go
+import "syscall"
+
+loader := configs.NewLoader(configs.WithConfigFile("config.yaml"))
+if err := loader.Load(cfg); err != nil {
+    log.Fatal(err)
+}
+
+if err := loader.WatchSignal(cfg, func(err error) {
+    if err != nil {
+        log.Println("config reload failed:", err)
+        return
+    }
+    log.Println("config reloaded")
+}, syscall.SIGHUP); err != nil {
+    log.Fatal(err)
+}
+```
+
+```bash
+# Reload running process without restart
+kill -HUP <pid>
+```
+
+`WatchSignal` uses the same safe-swap semantics as `Watch` and `Reload`.
+
+## Sample YAML Generation
+
+Generate a documented YAML template from your config struct — useful for bootstrapping a config file or generating reference documentation:
+
+```go
+if err := configs.WriteSample(os.Stdout, &Config{}); err != nil {
+    log.Fatal(err)
+}
+```
+
+Output includes default values, descriptions, validation rules, and annotations for required/sensitive fields:
+
+```yaml
+# server port
+# min: 1, max: 65535
+port: 8080
+
+# log level
+# one of: [debug info warn error]
+log_level: "info"
+
+# required
+# sensitive
+token: ""
+
+database:
+  host: "localhost"
+  port: 5432
+```
+
+After calling `Load`, you can also generate from a loader instance:
+
+```go
+loader := configs.NewLoader(configs.WithConfigFile("config.yaml"))
+loader.Load(cfg)
+loader.WriteSample(os.Stdout)
+```
+
 ## Remote Config
 
 Any source that implements `RemoteProvider` can be mixed into the loading order alongside config files. Registration order determines precedence — later = higher priority within the file/remote layer. Env vars and flags always win.

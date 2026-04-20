@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1083,6 +1084,240 @@ func TestLoaderWatchRemoteValidationError(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Watch callback not called within 3 seconds")
+	}
+}
+
+// --- WriteSample ---
+
+func TestWriteSampleBasic(t *testing.T) {
+	type cfg struct {
+		Port int    `yaml:"port" default:"8080" description:"server port" validate:"min=1,max=65535"`
+		Host string `yaml:"host" default:"localhost"`
+	}
+	var buf bytes.Buffer
+	if err := WriteSample(&buf, &cfg{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	out := buf.String()
+
+	for _, want := range []string{"port:", "8080", "host:", `"localhost"`, "# server port", "# min: 1"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("WriteSample output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestWriteSampleNested(t *testing.T) {
+	type cfg struct {
+		Database struct {
+			Host string `yaml:"host" default:"localhost"`
+			Port int    `yaml:"port" default:"5432"`
+		} `yaml:"database"`
+	}
+	var buf bytes.Buffer
+	if err := WriteSample(&buf, &cfg{}); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "database:") {
+		t.Errorf("expected 'database:' section:\n%s", out)
+	}
+	// nested fields should be indented
+	if !strings.Contains(out, "  host:") {
+		t.Errorf("expected indented 'host:' inside database:\n%s", out)
+	}
+}
+
+func TestWriteSampleAnnotations(t *testing.T) {
+	type cfg struct {
+		Token    string `yaml:"token" required:"true"`
+		Password string `yaml:"password" sensitive:"true" default:"s3cret"`
+	}
+	var buf bytes.Buffer
+	if err := WriteSample(&buf, &cfg{}); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "# required") {
+		t.Errorf("expected '# required' comment:\n%s", out)
+	}
+	if !strings.Contains(out, "# sensitive") {
+		t.Errorf("expected '# sensitive' comment:\n%s", out)
+	}
+}
+
+func TestWriteSampleNoDefault(t *testing.T) {
+	type cfg struct {
+		Count int    `yaml:"count"`
+		Label string `yaml:"label"`
+		Debug bool   `yaml:"debug"`
+	}
+	var buf bytes.Buffer
+	if err := WriteSample(&buf, &cfg{}); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "count: 0") {
+		t.Errorf("expected 'count: 0' for int with no default:\n%s", out)
+	}
+	if !strings.Contains(out, `label: ""`) {
+		t.Errorf("expected 'label: \"\"' for string with no default:\n%s", out)
+	}
+	if !strings.Contains(out, "debug: false") {
+		t.Errorf("expected 'debug: false' for bool with no default:\n%s", out)
+	}
+}
+
+func TestWriteSampleYAMLDash(t *testing.T) {
+	type cfg struct {
+		Keep    string `yaml:"keep" default:"yes"`
+		Skipped string `yaml:"-"`
+	}
+	var buf bytes.Buffer
+	if err := WriteSample(&buf, &cfg{}); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if strings.Contains(out, "skipped") || strings.Contains(out, "Skipped") {
+		t.Errorf("yaml:\"-\" field should be omitted:\n%s", out)
+	}
+	if !strings.Contains(out, "keep:") {
+		t.Errorf("expected 'keep:' in output:\n%s", out)
+	}
+}
+
+func TestLoaderWriteSample(t *testing.T) {
+	type cfg struct {
+		Port int `yaml:"port" default:"8080"`
+	}
+	c := &cfg{}
+	loader := NewLoader(WithoutFlags())
+	if err := loader.Load(c); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	if err := loader.WriteSample(&buf); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "port:") {
+		t.Errorf("expected 'port:' in WriteSample output:\n%s", buf.String())
+	}
+}
+
+func TestWriteSampleBeforeLoad(t *testing.T) {
+	loader := NewLoader(WithoutFlags())
+	if err := loader.WriteSample(&bytes.Buffer{}); err == nil {
+		t.Fatal("expected error when WriteSample called before Load")
+	}
+}
+
+// --- WatchSignal ---
+
+func TestWatchSignal(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.yaml")
+	os.WriteFile(cfgFile, []byte("port: 8080\n"), 0644)
+
+	type cfg struct {
+		Port int `yaml:"port" default:"3000"`
+	}
+	c := &cfg{}
+	loader := NewLoader(WithConfigFile(cfgFile), WithoutFlags())
+	if err := loader.Load(c); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	if err := loader.WatchSignal(c, func(err error) {
+		done <- err
+	}, syscall.SIGUSR1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Update file then trigger reload via signal
+	os.WriteFile(cfgFile, []byte("port: 9090\n"), 0644)
+	syscall.Kill(os.Getpid(), syscall.SIGUSR1)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WatchSignal callback error: %v", err)
+		}
+		if c.Port != 9090 {
+			t.Errorf("Port = %d, want 9090 after signal reload", c.Port)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("WatchSignal callback not called within 3 seconds")
+	}
+}
+
+func TestWatchSignalValidationError(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.yaml")
+	os.WriteFile(cfgFile, []byte("port: 8080\n"), 0644)
+
+	type cfg struct {
+		Port int `yaml:"port" default:"3000" validate:"min=1,max=65535"`
+	}
+	c := &cfg{}
+	loader := NewLoader(WithConfigFile(cfgFile), WithoutFlags())
+	if err := loader.Load(c); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	if err := loader.WatchSignal(c, func(err error) {
+		done <- err
+	}, syscall.SIGUSR2); err != nil {
+		t.Fatal(err)
+	}
+
+	os.WriteFile(cfgFile, []byte("port: 99999\n"), 0644)
+	syscall.Kill(os.Getpid(), syscall.SIGUSR2)
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected validation error from WatchSignal")
+		}
+		if c.Port != 8080 {
+			t.Errorf("Port = %d, want 8080 (unchanged on validation error)", c.Port)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("WatchSignal callback not called within 3 seconds")
+	}
+}
+
+func TestWatchSignalNoSources(t *testing.T) {
+	type cfg struct {
+		Port int `yaml:"port" default:"8080"`
+	}
+	c := &cfg{}
+	loader := NewLoader(WithoutFlags())
+	if err := loader.Load(c); err != nil {
+		t.Fatal(err)
+	}
+	if err := loader.WatchSignal(c, func(error) {}, syscall.SIGUSR1); err == nil {
+		t.Fatal("expected error when no config sources registered")
+	}
+}
+
+func TestWatchSignalNoSignals(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.yaml")
+	os.WriteFile(cfgFile, []byte("port: 8080\n"), 0644)
+
+	type cfg struct {
+		Port int `yaml:"port" default:"8080"`
+	}
+	c := &cfg{}
+	loader := NewLoader(WithConfigFile(cfgFile), WithoutFlags())
+	if err := loader.Load(c); err != nil {
+		t.Fatal(err)
+	}
+	if err := loader.WatchSignal(c, func(error) {}); err == nil {
+		t.Fatal("expected error when no signals provided")
 	}
 }
 
